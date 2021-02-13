@@ -72,10 +72,16 @@ def get_rotated_mnist(task_id, batch_size):
 		torchvision.transforms.ToTensor(),
 		])
 
-	train_loader = torch.utils.data.DataLoader(torchvision.datasets.MNIST('./data/', train=True, download=True, transform=transforms), batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+	npr = np.random.RandomState(123)
+	train_dataset = torchvision.datasets.MNIST('./data/', train=True, download=True, transform=transforms)
+	n = len(train_dataset)
+	train_dataset, cal_dataset = torch.utils.data.random_split(train_dataset, [int(n*0.9), int(n*0.1)], generator=torch.Generator().manual_seed(123))
+
+	train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+	cal_loader = torch.utils.data.DataLoader(cal_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
 	test_loader = torch.utils.data.DataLoader(torchvision.datasets.MNIST('./data/', train=False, download=True, transform=transforms),  batch_size=256, shuffle=False, num_workers=4, pin_memory=True)
 
-	return train_loader, test_loader
+	return train_loader, cal_loader, test_loader
 
 
 def get_rotated_mnist_tasks(num_tasks, batch_size):
@@ -87,8 +93,8 @@ def get_rotated_mnist_tasks(num_tasks, batch_size):
 	"""
 	datasets = {}
 	for task_id in range(1, num_tasks+1):
-		train_loader, test_loader = get_rotated_mnist(task_id, batch_size)
-		datasets[task_id] = {'train': train_loader, 'test': test_loader}
+		train_loader, cal_loader, test_loader = get_rotated_mnist(task_id, batch_size)
+		datasets[task_id] = {'train': train_loader, 'cal': cal_loader, 'test': test_loader}
 	return datasets
 
 

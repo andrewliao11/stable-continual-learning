@@ -1,3 +1,4 @@
+import os
 import uuid
 import torch
 import argparse
@@ -12,25 +13,27 @@ from external_libs.hessian_eigenthings import compute_hessian_eigenthings
 
 
 TRIAL_ID = uuid.uuid4().hex.upper()[0:6]
-EXPERIMENT_DIRECTORY = './outputs/{}'.format(TRIAL_ID)
+#EXPERIMENT_DIRECTORY = './outputs/{}'.format(TRIAL_ID)
+EXPERIMENT_DIRECTORY = './outputs'
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
-def parse_arguments():
-	parser = argparse.ArgumentParser(description='Argument parser')
-	parser.add_argument('--tasks', default=5, type=int, help='total number of tasks')
-	parser.add_argument('--epochs-per-task', default=1, type=int, help='epochs per task')
-	parser.add_argument('--dataset', default='rot-mnist', type=str, help='dataset. options: rot-mnist, perm-mnist, cifar100')
-	parser.add_argument('--batch-size', default=10, type=int, help='batch-size')
-	parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
-	parser.add_argument('--gamma', default=0.4, type=float, help='learning rate decay. Use 1.0 for no decay')
-	parser.add_argument('--dropout', default=0.25, type=float, help='dropout probability. Use 0.0 for no dropout')
-	parser.add_argument('--hiddens', default=256, type=int, help='num of hidden neurons in each layer of a 2-layer MLP')
-	parser.add_argument('--compute-eigenspectrum', default=False, type=bool, help='compute eigenvalues/eigenvectors?')
-	parser.add_argument('--seed', default=1234, type=int, help='random seed')
+#def parse_arguments():
+parser = argparse.ArgumentParser(description='Argument parser')
+parser.add_argument('--tasks', default=5, type=int, help='total number of tasks')
+parser.add_argument('--epochs-per-task', default=1, type=int, help='epochs per task')
+parser.add_argument('--dataset', default='rot-mnist', type=str, help='dataset. options: rot-mnist, perm-mnist, cifar100')
+parser.add_argument('--batch-size', default=10, type=int, help='batch-size')
+parser.add_argument('--calibrate_option', default='none', choices=['none', 'current', 'all_data', 'eval_data'])
+parser.add_argument('--lr', default=0.1, type=float, help='learning rate')
+parser.add_argument('--gamma', default=0.4, type=float, help='learning rate decay. Use 1.0 for no decay')
+parser.add_argument('--dropout', default=0.25, type=float, help='dropout probability. Use 0.0 for no dropout')
+parser.add_argument('--hiddens', default=256, type=int, help='num of hidden neurons in each layer of a 2-layer MLP')
+parser.add_argument('--compute-eigenspectrum', default=False, type=bool, help='compute eigenvalues/eigenvectors?')
+parser.add_argument('--seed', default=1234, type=int, help='random seed')
 
-	args = parser.parse_args()
-	return args
+args = parser.parse_args()
+EXPERIMENT_DIRECTORY = os.path.join(EXPERIMENT_DIRECTORY, "{}-{}-{}-{}".format(args.dataset, args.tasks, args.calibrate_option, args.seed))
 
 
 def init_experiment(args):
@@ -50,11 +53,12 @@ def init_experiment(args):
 	# 3. create data structures to store metrics
 	loss_db = {t: [0 for i in range(args.tasks*args.epochs_per_task)] for t in range(1, args.tasks+1)}
 	acc_db =  {t: [0 for i in range(args.tasks*args.epochs_per_task)] for t in range(1, args.tasks+1)}
+	ece_db =  {t: [0 for i in range(args.tasks*args.epochs_per_task)] for t in range(1, args.tasks+1)}
 	hessian_eig_db = {}
-	return acc_db, loss_db, hessian_eig_db
+	return acc_db, loss_db, ece_db, hessian_eig_db
 
 
-def end_experiment(args, acc_db, loss_db, hessian_eig_db):
+def end_experiment(args, acc_db, ece_db, loss_db, hessian_eig_db):
 	
 	# 1. save all metrics into csv file
 	acc_df = pd.DataFrame(acc_db)
@@ -65,19 +69,24 @@ def end_experiment(args, acc_db, loss_db, hessian_eig_db):
 	loss_df.to_csv(EXPERIMENT_DIRECTORY+'/loss.csv')
 	visualize_result(loss_df, EXPERIMENT_DIRECTORY+'/loss.png')
 	
+	ece_df = pd.DataFrame(ece_db)
+	ece_df.to_csv(EXPERIMENT_DIRECTORY+'/ece.csv')
+	visualize_result(ece_df, EXPERIMENT_DIRECTORY+'/ece.png')
+	
 	hessian_df = pd.DataFrame(hessian_eig_db)
 	hessian_df.to_csv(EXPERIMENT_DIRECTORY+'/hessian_eigs.csv')
 	
 	# 2. calculate average accuracy and forgetting (c.f. ``evaluation`` section in our paper)
 	score = np.mean([acc_db[i][-1] for i in acc_db.keys()])
+	ece = np.mean([ece_db[i][-1] for i in ece_db.keys()])
 	forget = np.mean([max(acc_db[i])-acc_db[i][-1] for i in range(1, args.tasks)])/100.0
 	
-	print('average accuracy = {}, forget = {}'.format(score, forget))
+	print('average accuracy = {}, forget = {}, average ece = {}'.format(score, forget, ece))
 	print()
 	print('------------------- Experiment ended -----------------')
 
 
-def log_metrics(metrics, time, task_id, acc_db, loss_db):
+def log_metrics(metrics, time, task_id, acc_db, ece_db, loss_db):
 	"""
 	Log accuracy and loss at different times of training
 	"""
@@ -85,9 +94,11 @@ def log_metrics(metrics, time, task_id, acc_db, loss_db):
 	# log to db
 	acc = metrics['accuracy']
 	loss = metrics['loss']
+	ece = metrics['ece']
 	loss_db[task_id][time-1] = loss
+	ece_db[task_id][time-1] = ece
 	acc_db[task_id][time-1] = acc
-	return acc_db, loss_db
+	return acc_db, ece_db, loss_db
 
 
 def save_eigenvec(filename, arr):

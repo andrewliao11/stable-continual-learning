@@ -1,11 +1,14 @@
 import os
+import logging
 import torch
 import numpy as np
 import pandas as pd
 import torch.nn as nn
 from stable_sgd.models import MLP, ResNet18
 from stable_sgd.data_utils import get_permuted_mnist_tasks, get_rotated_mnist_tasks, get_split_cifar100_tasks
-from stable_sgd.utils import parse_arguments, DEVICE, init_experiment, end_experiment, log_metrics, log_hessian, save_checkpoint
+from stable_sgd.utils import DEVICE, init_experiment, end_experiment, log_metrics, log_hessian, save_checkpoint
+from stable_sgd.utils import EXPERIMENT_DIRECTORY
+from stable_sgd.temperature_scaling import ECELoss, ModelWithTemperature
 
 
 def train_single_epoch(net, optimizer, loader, criterion, task_id=None):
@@ -47,9 +50,15 @@ def eval_single_epoch(net, loader, criterion, task_id=None):
 	:return:
 	"""
 	net = net.to(DEVICE)
+	#TODO: does the batchnor stats get initialized?
 	net.eval()
 	test_loss = 0
 	correct = 0
+	avg_ece = None
+
+	logits_list = []
+	labels_list = []
+	ece_criterion = ECELoss().to(DEVICE)
 	with torch.no_grad():
 		for data, target in loader:
 			data = data.to(DEVICE)
@@ -62,10 +71,18 @@ def eval_single_epoch(net, loader, criterion, task_id=None):
 			test_loss += criterion(output, target).item()
 			pred = output.data.max(1, keepdim=True)[1]
 			correct += pred.eq(target.data.view_as(pred)).sum()
+			
+			logits_list.append(output)
+			labels_list.append(target)
+
 	test_loss /= len(loader.dataset)
 	correct = correct.to('cpu')
 	avg_acc = 100.0 * float(correct.numpy()) / len(loader.dataset)
-	return {'accuracy': avg_acc, 'loss': test_loss}
+
+	logits = torch.cat(logits_list).cuda()
+	labels = torch.cat(labels_list).cuda()
+	avg_ece = ece_criterion(logits, labels).item()
+	return {'accuracy': avg_acc, 'loss': test_loss, 'ece': avg_ece}
 
 
 def get_benchmark_data_loader(args):
@@ -104,6 +121,35 @@ def get_benchmark_model(args):
 						"The code supports 'perm-mnist, rot-mnist, and cifar-100.")
 
 
+def calibrate_model(model, args, tasks, current_task_id, prev_task_id):
+	
+	if args.calibrate_option == 'none':
+		cal_model = model
+	elif args.calibrate_option == 'current':
+		assert 'cifar' not in args.dataset, "In SplitCIFAR, it does not make sense to calibrate with current task data"
+		cal_loader = tasks[current_task_id]['cal']
+		cal_model = ModelWithTemperature(model)
+		cal_model.set_temperature(cal_loader)
+	elif args.calibrate_option == 'all_data':
+		assert 'cifar' not in args.dataset, "In SplitCIFAR, the calibration needs to consider the offset. Each task has its own parameters"
+
+		# concat dataset
+		cal_datasets = [tasks[i]['cal'].dataset for i in range(1, current_task_id+1)]
+		cal_datasets = torch.utils.data.ConcatDataset(cal_datasets)
+		cal_loader = torch.utils.data.DataLoader(cal_datasets, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+
+		cal_model = ModelWithTemperature(model)
+		cal_model.set_temperature(cal_loader)
+	elif args.calibrate_option == 'eval_data':
+		assert 'cifar' not in args.dataset, "In SplitCIFAR, the calibration needs to consider the offset. Each task has its own parameters"
+
+		cal_loader = tasks[prev_task_id]['cal']
+		cal_model = ModelWithTemperature(model)
+		cal_model.set_temperature(cal_loader)
+	
+	return cal_model
+
+
 def run(args):
 	"""
 	Run a single run of experiment.
@@ -111,7 +157,8 @@ def run(args):
 	:param args: please see `utils.py` for arguments and options
 	"""
 	# init experiment
-	acc_db, loss_db, hessian_eig_db = init_experiment(args)
+	acc_db, loss_db, ece_db, hessian_eig_db = init_experiment(args)
+
 
 	# load benchmarks and model
 	print("Loading {} tasks for {}".format(args.tasks, args.dataset))
@@ -135,15 +182,22 @@ def run(args):
 			time += 1
 
 			# 2. evaluate on all tasks up to now, including the current task
-			for prev_task_id in range(1, current_task_id+1):
-				# 2.0. only evaluate once a task is finished
-				if epoch == args.epochs_per_task:
+			# 2.0. only evaluate once a task is finished
+			if epoch == args.epochs_per_task:
+				
+				for prev_task_id in range(1, current_task_id+1):
+				
 					model = model.to(DEVICE)
 					val_loader = tasks[prev_task_id]['test']
-					
+
 					# 2.1. compute accuracy and loss
-					metrics = eval_single_epoch(model, val_loader, criterion, prev_task_id)
-					acc_db, loss_db = log_metrics(metrics, time, prev_task_id, acc_db, loss_db)
+
+					cal_model = calibrate_model(model, args, tasks, current_task_id, prev_task_id)
+
+
+					#metrics = eval_single_epoch(model, val_loader, criterion, prev_task_id)
+					metrics = eval_single_epoch(cal_model, val_loader, criterion, prev_task_id)
+					acc_db, ece_db, loss_db = log_metrics(metrics, time, prev_task_id, acc_db, ece_db, loss_db)
 					
 					# 2.2. (optional) compute eigenvalues and eigenvectors of Loss Hessian
 					if prev_task_id == current_task_id and args.compute_eigenspectrum:
@@ -152,9 +206,10 @@ def run(args):
 					# 2.3. save model parameters
 					save_checkpoint(model, time)
 
-	end_experiment(args, acc_db, loss_db, hessian_eig_db)
+	end_experiment(args, acc_db, ece_db, loss_db, hessian_eig_db)
 
 
 if __name__ == "__main__":
-	args = parse_arguments()
+	#args = parse_arguments()
+	from stable_sgd.utils import args
 	run(args)
